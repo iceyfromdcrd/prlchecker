@@ -70,7 +70,7 @@ def send_heartbeat():
             }, timeout=3)
         except requests.exceptions.RequestException:
             pass
-        time.sleep(15) # Heartbeat every 15 seconds
+        time.sleep(15)
 
 def check_balance_via_rpc(address):
     payload = {
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
             try:
-                # Fetch a batch matching worker capacity instead of hammering endpoint per wallet
+                # Fetch a batch matching worker capacity cleanly
                 res = requests.get(f"{CONFIG.url}/get_wallets?count={MAX_WORKERS}", timeout=3)
                 if res.status_code == 200:
                     wallets = res.json().get("wallets", [])
@@ -125,7 +125,6 @@ if __name__ == "__main__":
                         time.sleep(0.5)
                         continue
                     
-                    # Distribute batch across local thread pool workers cleanly
                     futures = [executor.submit(process_single_wallet, w) for w in wallets]
                     for future in futures:
                         future.result()
